@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+# Task Tracker - A CLI for Toggl Track time tracking with Zendesk integration
+# Validates Zendesk tickets before starting time tracking with customizable ticket ID formatting
+set -euo pipefail
+
+TASK_TRACKER_VERSION="1.0.0"
+TASK_TRACKER_REPO_USER="jeromecoloma"
+
+CONFIG_LOADED_FROM=""
+
+_try_source() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  if grep -q '^\s*export\s' "$f"; then
+    # shellcheck disable=SC1090
+    . "$f"
+  else
+    set -a
+    # shellcheck disable=SC1090
+    . "$f"
+    set +a
+  fi
+  CONFIG_LOADED_FROM="$f"
+}
+
+load_config() {
+  local skip_warning="${1:-false}"
+  local tried=()
+  for f in \
+    "./.tasktrackerrc" "$HOME/.tasktrackerrc" "$HOME/.config/task-tracker/.tasktrackerrc"
+  do
+    if _try_source "$f"; then
+      break
+    else
+      tried+=("$f")
+    fi
+  done
+
+  # Show helpful message if no config found (unless we're in init mode)
+  if [[ -z "${CONFIG_LOADED_FROM:-}" && "$skip_warning" != "true" ]]; then
+    printf "${YELLOW}⚠️  No task-tracker configuration found${RESET}\n" >&2
+    printf "${BLUE}💡 Run 'task-tracker init' to create a configuration file${RESET}\n" >&2
+    printf "${BLUE}   Using default settings for now...${RESET}\n\n" >&2
+    
+    # Also show debug info if requested
+    if [[ "${TASK_TRACKER_DEBUG:-}" == "1" ]]; then
+      printf "Looked in:\n- %s\n" "${tried[@]}" >&2
+    fi
+  fi
+}
+
+# Color codes for styling
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+die() { printf "${RED}❌ %s${RESET}\n" "$*" >&2; exit 1; }
+
+# Dependency checking
+check_dependencies() {
+  local missing=()
+  
+  if ! command -v toggl-track >/dev/null 2>&1; then
+    missing+=("toggl-track")
+  fi
+  
+  if ! command -v zendesk-cli >/dev/null 2>&1; then
+    missing+=("zendesk-cli")
+  fi
+  
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    printf "\n${RED}${BOLD}❌ Missing Dependencies${RESET}\n\n" >&2
+    printf "${RED}The following required tools are not installed:${RESET}\n" >&2
+    for dep in "${missing[@]}"; do
+      printf "  ${RED}•${RESET} %s\n" "$dep" >&2
+    done
+    printf "\n${BLUE}💡 Installation instructions:${RESET}\n" >&2
+    
+    if [[ " ${missing[*]} " =~ " toggl-track " ]]; then
+      printf "   ${GREEN}toggl-track:${RESET} https://github.com/jeromecoloma/toggl-track\n" >&2
+      printf "   curl -fsSL https://raw.githubusercontent.com/jeromecoloma/toggl-track/main/install.sh | bash\n\n" >&2
+    fi
+    
+    if [[ " ${missing[*]} " =~ " zendesk-cli " ]]; then
+      printf "   ${GREEN}zendesk-cli:${RESET} https://github.com/jeromecoloma/zendesk-cli\n" >&2
+      printf "   curl -fsSL https://raw.githubusercontent.com/jeromecoloma/zendesk-cli/main/install.sh | bash\n\n" >&2
+    fi
+    
+    exit 1
+  fi
+}
+
+# Format ticket ID based on config
+format_ticket_id() {
+  local ticket_id="$1"
+  local prefix="${TICKET_PREFIX:-#}"
+  local suffix="${TICKET_SUFFIX:-}"
+  
+  printf "%s%s%s" "$prefix" "$ticket_id" "$suffix"
+}
+
+# Validate Zendesk ticket exists (simple check)
+validate_zendesk_ticket() {
+  local ticket_id="$1"
+  
+  printf "${BLUE}🔍 Validating Zendesk ticket #%s...${RESET}\n" "$ticket_id" >&2
+  
+  # Try to get ticket info from zendesk-cli (just check if it exists)
+  if zendesk-cli ticket-info "$ticket_id" >/dev/null 2>&1; then
+    printf "${GREEN}✅ Ticket #%s exists${RESET}\n" "$ticket_id" >&2
+    return 0
+  else
+    printf "${RED}❌ Ticket #%s not found or inaccessible${RESET}\n" "$ticket_id" >&2
+    return 1
+  fi
+}
+
+# Generate description with ticket ID and subject
+generate_description() {
+  local ticket_id="$1"
+  local subject="${2:-}"
+  
+  # Use default subject if not provided
+  if [[ -z "$subject" ]]; then
+    subject="${DEFAULT_SUBJECT:-Ticket Update}"
+  fi
+  
+  # Format the ticket ID
+  local formatted_ticket
+  formatted_ticket=$(format_ticket_id "$ticket_id")
+  
+  # Create final description: [#12345] subject
+  printf "[%s] %s" "$formatted_ticket" "$subject"
+}
+
+# Start command with ticket ID and optional subject
+start_with_ticket() {
+  local ticket_id=""
+  local subject=""
+  local project_id=""
+  local tags=""
+  local validate_ticket=true
+  
+  # Parse arguments - ticket ID first, then optional subject
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-validate)
+        validate_ticket=false
+        shift
+        ;;
+      --tags)
+        tags="$2"
+        shift 2
+        ;;
+      --project)
+        project_id="$2"
+        shift 2
+        ;;
+      --help|-h)
+        show_start_help
+        exit 0
+        ;;
+      -*)
+        die "Unknown option: $1"
+        ;;
+      *)
+        if [[ -z "$ticket_id" ]]; then
+          ticket_id="$1"
+        elif [[ -z "$subject" ]]; then
+          subject="$1"
+        else
+          die "Too many arguments. Usage: task-tracker start <ticket_id> [\"subject\"] [options]"
+        fi
+        shift
+        ;;
+    esac
+  done
+  
+  # Ticket ID is required
+  if [[ -z "$ticket_id" ]]; then
+    die "Ticket ID is required. Usage: task-tracker start <ticket_id> [\"subject\"] [options]"
+  fi
+  
+  # Validate ticket ID is numeric
+  if ! [[ "$ticket_id" =~ ^[0-9]+$ ]]; then
+    die "Ticket ID must be numeric: $ticket_id"
+  fi
+  
+  # Validate ticket exists (unless validation is disabled)
+  if [[ "$validate_ticket" == "true" ]]; then
+    if ! validate_zendesk_ticket "$ticket_id"; then
+      die "Cannot start tracking for invalid ticket #$ticket_id"
+    fi
+  fi
+  
+  # Generate complete description
+  local description
+  description=$(generate_description "$ticket_id" "$subject")
+  
+  # Build toggl-track command
+  local toggl_args=("$description")
+  
+  if [[ -n "$project_id" ]]; then
+    toggl_args+=("$project_id")
+  fi
+  
+  if [[ -n "$tags" ]]; then
+    toggl_args+=("--tags" "$tags")
+  fi
+  
+  printf "${GREEN}🚀 Starting time tracking: ${description}${RESET}\n" >&2
+  
+  # Execute toggl-track start command
+  toggl-track start "${toggl_args[@]}"
+}
+
+# Format duration from seconds to human-readable format
+format_duration() {
+  local seconds="$1"
+  local hours=$((seconds / 3600))
+  local minutes=$(((seconds % 3600) / 60))
+  
+  if [[ $hours -gt 0 ]]; then
+    if [[ $minutes -gt 0 ]]; then
+      printf "%dh %dm" "$hours" "$minutes"
+    else
+      printf "%dh" "$hours"
+    fi
+  else
+    printf "%dm" "$minutes"
+  fi
+}
+
+# Extract ticket ID from description
+extract_ticket_id() {
+  local description="$1"
+  
+  # Extract ticket ID from formats like "[#12345]" or "[TICKET-12345]" or "[12345]"
+  if [[ "$description" =~ \[([^]]*)\] ]]; then
+    local ticket_part="${BASH_REMATCH[1]}"
+    # Remove any prefix/suffix to get just the numeric ID
+    local ticket_id
+    ticket_id=$(echo "$ticket_part" | sed 's/^[^0-9]*//; s/[^0-9]*$//')
+    echo "$ticket_id"
+  fi
+}
+
+# Extract subject from description
+extract_subject() {
+  local description="$1"
+  
+  # Extract everything after the ticket ID bracket
+  if [[ "$description" =~ \[[^]]*\]\ (.*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "$description"
+  fi
+}
+
+# Copy text to clipboard (cross-platform)
+copy_to_clipboard() {
+  local text="$1"
+  
+  # Try different clipboard tools based on what's available
+  if command -v pbcopy >/dev/null 2>&1; then
+    # macOS
+    echo "$text" | pbcopy
+    return $?
+  elif command -v xclip >/dev/null 2>&1; then
+    # Linux with xclip
+    echo "$text" | xclip -selection clipboard
+    return $?
+  elif command -v xsel >/dev/null 2>&1; then
+    # Linux with xsel
+    echo "$text" | xsel --clipboard --input
+    return $?
+  elif command -v clip.exe >/dev/null 2>&1; then
+    # WSL/Windows
+    echo "$text" | clip.exe
+    return $?
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+    # Wayland
+    echo "$text" | wl-copy
+    return $?
+  else
+    # No supported clipboard tool found
+    return 1
+  fi
+}
+
+# Enhanced stop command with formatted summary
+stop_with_summary() {
+  printf "${BLUE}🛑 Stopping time tracking...${RESET}\n" >&2
+  
+  # Get current time entry info before stopping
+  local current_entry
+  current_entry=$(toggl-track status 2>/dev/null || echo "")
+  
+  # Stop the timer and capture output
+  local stop_output
+  stop_output=$(toggl-track stop 2>&1)
+  local stop_exit_code=$?
+  
+  if [[ $stop_exit_code -ne 0 ]]; then
+    printf "${RED}❌ Failed to stop timer${RESET}\n" >&2
+    echo "$stop_output" >&2
+    return $stop_exit_code
+  fi
+  
+  # Show the original toggl output
+  echo "$stop_output"
+  
+  # Parse JSON output from toggl-track stop
+  local description=""
+  local duration_seconds=""
+  local start_time=""
+  local stop_time=""
+  
+  # Extract description from JSON
+  if [[ "$stop_output" =~ \"description\":[[:space:]]*\"([^\"]*) ]]; then
+    description="${BASH_REMATCH[1]}"
+  fi
+  
+  # Extract duration from JSON (in seconds)
+  if [[ "$stop_output" =~ \"duration\":[[:space:]]*([0-9]+) ]]; then
+    duration_seconds="${BASH_REMATCH[1]}"
+  fi
+  
+  # Extract start time for reference
+  if [[ "$stop_output" =~ \"start\":[[:space:]]*\"([^\"]*) ]]; then
+    start_time="${BASH_REMATCH[1]}"
+  fi
+  
+  # Extract stop time for reference
+  if [[ "$stop_output" =~ \"stop\":[[:space:]]*\"([^\"]*) ]]; then
+    stop_time="${BASH_REMATCH[1]}"
+  fi
+  
+  # If we couldn't extract essential info, still try to show what we can
+  if [[ -z "$duration_seconds" && -z "$description" ]]; then
+    printf "${YELLOW}⚠️  Could not extract time entry details for summary${RESET}\n" >&2
+    if [[ "${TASK_TRACKER_DEBUG:-}" == "1" ]]; then
+      printf "${YELLOW}Debug - Stop output: %s${RESET}\n" "$stop_output" >&2
+    fi
+    return 0
+  fi
+  
+  # Generate formatted summary
+  local formatted_duration="Unknown"
+  if [[ -n "$duration_seconds" && "$duration_seconds" -gt 0 ]]; then
+    formatted_duration=$(format_duration "$duration_seconds")
+  fi
+  
+  local ticket_id=""
+  local subject="$description"
+  
+  if [[ -n "$description" ]]; then
+    ticket_id=$(extract_ticket_id "$description")
+    subject=$(extract_subject "$description")
+  fi
+  
+  # Use current time in configured timezone for the summary timestamp
+  local timestamp
+  if [[ -n "${TIMEZONE:-}" ]]; then
+    # Use configured timezone
+    timestamp=$(TZ="$TIMEZONE" date +"%Y-%m-%d %H:%M:%S")
+  else
+    # Use system local timezone
+    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  fi
+  
+  # Build summary
+  local support_name="${SUPPORT_NAME:-Support}"
+  local zendesk_base="${ZENDESK_BASE_URL:-https://yourcompany.zendesk.com}"
+  
+  printf "\n${GREEN}📊 Time Entry Summary:${RESET}\n" >&2
+  
+  local summary_text
+  if [[ -n "$ticket_id" ]]; then
+    local zendesk_url="${zendesk_base}/agent/tickets/${ticket_id}"
+    summary_text="[${formatted_duration} - ${timestamp}, ${support_name}] - ${zendesk_url} - ${subject}"
+    printf "${BOLD}%s${RESET}\n" "$summary_text" >&2
+  else
+    summary_text="[${formatted_duration} - ${timestamp}, ${support_name}] - ${subject}"
+    printf "${BOLD}%s${RESET}\n" "$summary_text" >&2
+  fi
+  
+  # Copy to clipboard if enabled
+  if [[ "${COPY_TO_CLIPBOARD:-true}" == "true" ]]; then
+    if copy_to_clipboard "$summary_text"; then
+      printf "${GREEN}📋 Copied to clipboard!${RESET}\n" >&2
+    else
+      printf "${YELLOW}⚠️  Could not copy to clipboard${RESET}\n" >&2
+    fi
+  fi
+  
+  printf "\n" >&2
+}
+
+# Passthrough other commands to toggl-track
+passthrough_command() {
+  local cmd="$1"
+  shift
+  
+  case "$cmd" in
+    status|list-workspaces|list-projects|list-projects-ws|proj-id)
+      toggl-track "$cmd" "$@"
+      ;;
+    *)
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+# Configuration initialization
+init_config() {
+  local config_file="./.tasktrackerrc"
+  
+  printf "\n${BLUE}${BOLD}⚡ Task Tracker Initialization${RESET}\n\n" >&2
+  
+  if [[ -f "$config_file" ]]; then
+    printf "${YELLOW}⚠️  Configuration file already exists: ${config_file}${RESET}\n" >&2
+    printf "Do you want to overwrite it? (y/N): " >&2
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+      printf "${YELLOW}❌ Initialization cancelled${RESET}\n\n" >&2
+      return 0
+    fi
+  fi
+  
+  printf "This will create a ${GREEN}.tasktrackerrc${RESET} file in the current directory.\n" >&2
+  printf "This configures how ticket IDs are formatted in time tracking descriptions.\n\n" >&2
+  
+  printf "Continue with initialization? (y/N): " >&2
+  read -r response
+  
+  if [[ ! "$response" =~ ^[Yy]$ ]]; then
+    printf "${YELLOW}❌ Initialization cancelled${RESET}\n\n" >&2
+    return 0
+  fi
+  
+  printf "\nTicket ID prefix (e.g., 'TICKET-', leave empty for none): " >&2
+  read -r prefix
+  
+  printf "Ticket ID suffix (e.g., leave empty for none): " >&2
+  read -r suffix
+  
+  printf "\nDefault subject when none provided: " >&2
+  printf "\nExample: 'Ticket Update', 'Working on task', 'Development work'\n" >&2
+  printf "Default subject (default: 'Ticket Update'): " >&2
+  read -r default_subject
+  
+  # Set default if empty
+  if [[ -z "$default_subject" ]]; then
+    default_subject="Ticket Update"
+  fi
+  
+  printf "\nSupport person name (for stop command summary): " >&2
+  printf "\nExample: 'John Smith', 'Support Team'\n" >&2
+  printf "Support name: " >&2
+  read -r support_name
+  
+  printf "\nZendesk base URL (for generating ticket links): " >&2
+  printf "\nExample: 'https://yourcompany.zendesk.com'\n" >&2
+  printf "Zendesk URL: " >&2
+  read -r zendesk_url
+  
+  printf "\nTimezone for timestamps (optional): " >&2
+  printf "\nExample: 'Asia/Manila', 'America/New_York', 'Europe/London', 'UTC'\n" >&2
+  printf "Leave empty to use system timezone\n" >&2
+  printf "Timezone: " >&2
+  read -r timezone
+  
+  printf "\nCopy time entry summary to clipboard? (Y/n): " >&2
+  read -r copy_clipboard
+  if [[ "$copy_clipboard" =~ ^[Nn]$ ]]; then
+    copy_clipboard="false"
+  else
+    copy_clipboard="true"
+  fi
+  
+  # Create the config file
+  cat > "$config_file" << EOF
+# Task Tracker Configuration
+# Generated by task-tracker init on $(date)
+
+# Ticket ID formatting (optional)
+# These will be used to format ticket IDs in time tracking descriptions
+# Example: ticket ID "12345" with prefix "TICKET-" becomes "[TICKET-12345]"
+EOF
+  
+  if [[ -n "$prefix" ]]; then
+    echo "TICKET_PREFIX=\"$prefix\"" >> "$config_file"
+  fi
+  
+  if [[ -n "$suffix" ]]; then
+    echo "TICKET_SUFFIX=\"$suffix\"" >> "$config_file"
+  fi
+  
+  if [[ -z "$prefix" && -z "$suffix" ]]; then
+    echo "# TICKET_PREFIX=\"TICKET-\"" >> "$config_file"
+    echo "# TICKET_SUFFIX=\"\"" >> "$config_file"
+  fi
+  
+  # Add default subject
+  echo "" >> "$config_file"
+  echo "# Default subject when none provided on command line" >> "$config_file"
+  echo "# Used when running: task-tracker start 12345 (without subject)" >> "$config_file"
+  echo "# Full command: task-tracker start 12345 \"Custom subject\"" >> "$config_file"
+  echo "DEFAULT_SUBJECT=\"$default_subject\"" >> "$config_file"
+  
+  # Add support name
+  echo "" >> "$config_file"
+  echo "# Support person name (for stop command summary)" >> "$config_file"
+  if [[ -n "$support_name" ]]; then
+    echo "SUPPORT_NAME=\"$support_name\"" >> "$config_file"
+  else
+    echo "# SUPPORT_NAME=\"Your Name\"" >> "$config_file"
+  fi
+  
+  # Add Zendesk URL
+  echo "" >> "$config_file"
+  echo "# Zendesk base URL (for generating ticket links in stop command summary)" >> "$config_file"
+  echo "# Example: https://yourcompany.zendesk.com" >> "$config_file"
+  if [[ -n "$zendesk_url" ]]; then
+    echo "ZENDESK_BASE_URL=\"$zendesk_url\"" >> "$config_file"
+  else
+    echo "# ZENDESK_BASE_URL=\"https://yourcompany.zendesk.com\"" >> "$config_file"
+  fi
+  
+  # Add timezone
+  echo "" >> "$config_file"
+  echo "# Timezone for timestamps in stop command summary" >> "$config_file"
+  echo "# Example: \"Asia/Manila\", \"America/New_York\", \"Europe/London\", \"UTC\"" >> "$config_file"
+  echo "# If not set, uses system local timezone" >> "$config_file"
+  if [[ -n "$timezone" ]]; then
+    echo "TIMEZONE=\"$timezone\"" >> "$config_file"
+  else
+    echo "# TIMEZONE=\"Asia/Manila\"" >> "$config_file"
+  fi
+  
+  # Add clipboard option
+  echo "" >> "$config_file"
+  echo "# Copy time entry summary to clipboard on stop (true/false)" >> "$config_file"
+  echo "# Set to false to disable clipboard copying" >> "$config_file"
+  echo "COPY_TO_CLIPBOARD=\"$copy_clipboard\"" >> "$config_file"
+  
+  printf "\n${GREEN}✅ Configuration file created successfully!${RESET}\n" >&2
+  printf "   📄 File: ${GREEN}$config_file${RESET}\n\n" >&2
+  printf "${BLUE}💡 You can now run:${RESET}\n" >&2
+  printf "   task-tracker start 12345\n" >&2
+  printf "   task-tracker stop\n" >&2
+  printf "   task-tracker status\n\n" >&2
+  printf "${YELLOW}⚠️  Make sure to configure toggl-track and zendesk-cli first!${RESET}\n" >&2
+}
+
+show_start_help() {
+  cat <<HELP
+Task Tracker - Start Command Help
+
+Usage:
+  task-tracker start <ticket_id> ["subject"] [options]
+
+Arguments:
+  ticket_id      Zendesk ticket ID (required)
+  subject        Subject for the time entry (optional, quoted if contains spaces)
+
+Options:
+  --no-validate  Skip Zendesk ticket validation
+  --tags "a,b"   Tags for the time entry
+  --project ID   Project ID for the time entry
+  --help, -h     Show this help
+
+Examples:
+  task-tracker start 12345
+  task-tracker start 12345 "Fix login bug"
+  task-tracker start 67890 "Code review" --tags "review,development"
+  task-tracker start 99999 "Research task" --no-validate
+  task-tracker start 12345 "Bug fix" --project 987654 --tags "bugfix"
+
+How it works:
+  1. Validates ticket exists in Zendesk (unless --no-validate)
+  2. Creates description: "[#12345] subject" or "[#12345] DEFAULT_SUBJECT"
+  3. Starts time tracking with the formatted description
+
+Notes:
+  - Ticket ID must be numeric
+  - Subject uses DEFAULT_SUBJECT from .tasktrackerrc if not provided
+  - Use --no-validate to skip Zendesk validation
+  - Customize format via TICKET_PREFIX, TICKET_SUFFIX, DEFAULT_SUBJECT
+HELP
+}
+
+show_version() {
+  echo "📋 Task Tracker - Toggl & Zendesk Integration"
+  echo "Version: $TASK_TRACKER_VERSION"
+  echo ""
+  echo "A wrapper that validates Zendesk tickets before starting time tracking"
+  echo "Features: Ticket validation, Custom formatting, Toggl Track integration"
+  echo ""
+  echo "Dependencies:"
+  
+  # Check toggl-track
+  if command -v toggl-track >/dev/null 2>&1; then
+    local toggl_location toggl_version
+    toggl_location=$(command -v toggl-track)
+    toggl_version=$(toggl-track --version 2>/dev/null | grep -i "version:" | sed 's/.*Version:[[:space:]]*//' || echo "available")
+    echo "  ✅ toggl-track: $toggl_location"
+    echo "     Version: $toggl_version"
+  else
+    echo "  ❌ toggl-track: not installed"
+    echo "     Install: curl -fsSL https://raw.githubusercontent.com/jeromecoloma/toggl-track/main/install.sh | bash"
+  fi
+  
+  # Check zendesk-cli
+  if command -v zendesk-cli >/dev/null 2>&1; then
+    local zendesk_location
+    zendesk_location=$(command -v zendesk-cli)
+    echo "  ✅ zendesk-cli: $zendesk_location"
+    # Try to get version if available
+    local zendesk_version
+    zendesk_version=$(zendesk-cli --version 2>/dev/null | grep -i "version:" | sed 's/.*Version:[[:space:]]*//' || echo "available")
+    echo "     Version: $zendesk_version"
+  else
+    echo "  ❌ zendesk-cli: not installed"
+    echo "     Install: curl -fsSL https://raw.githubusercontent.com/jeromecoloma/zendesk-cli/main/install.sh | bash"
+  fi
+  
+  echo ""
+  echo "Usage: task-tracker help"
+}
+
+usage() {
+  local me
+  me="$(basename "$0")"
+  cat <<USAGE
+📋 Task Tracker - Toggl & Zendesk Integration v$TASK_TRACKER_VERSION
+
+Usage:
+  $me init
+  $me start <ticket_id> ["subject"] [--no-validate] [--tags "tag1,tag2"] [--project ID]
+  $me stop
+  $me status
+  $me list-workspaces
+  $me list-projects
+  $me list-projects-ws [workspace_id]
+  $me proj-id <substring>
+
+Global Options:
+  --help, -h        Show this help message
+  --version, -v     Show version information
+
+Config files searched (first found wins):
+  ./.tasktrackerrc, ~/.tasktrackerrc, ~/.config/task-tracker/.tasktrackerrc
+
+Environment Variables:
+  TASK_TRACKER_DEBUG=1    (prints debug info like loaded config path)
+
+Examples:
+  $me init                                    # Set up configuration
+  $me start 12345                             # Start with default subject
+  $me start 12345 "Fix login bug"             # Start with custom subject
+  $me start 67890 "Code review" --tags "review" # Start with subject and tags
+  $me start 99999 "Research" --no-validate    # Skip Zendesk validation
+  $me stop                                    # Stop current time entry
+  $me status                                  # Show current status
+
+How it works:
+  1. Validates ticket exists in Zendesk (unless --no-validate)
+  2. Creates description: "[#12345] subject" (uses DEFAULT_SUBJECT if none provided)
+  3. Starts toggl-track with the formatted description
+
+Dependencies Status:$(
+  if command -v toggl-track >/dev/null 2>&1; then
+    printf "\n  ✅ toggl-track: %s" "$(command -v toggl-track)"
+  else
+    printf "\n  ❌ toggl-track: not installed"
+  fi
+  if command -v zendesk-cli >/dev/null 2>&1; then
+    printf "\n  ✅ zendesk-cli: %s" "$(command -v zendesk-cli)"
+  else
+    printf "\n  ❌ zendesk-cli: not installed"
+  fi
+)
+
+Installation:
+  - toggl-track: https://github.com/jeromecoloma/toggl-track
+  - zendesk-cli: https://github.com/jeromecoloma/zendesk-cli
+
+Documentation: https://github.com/$TASK_TRACKER_REPO_USER/task-tracker
+Report issues: https://github.com/$TASK_TRACKER_REPO_USER/task-tracker/issues
+USAGE
+}
+
+# Check for global help/version flags FIRST (but not command-specific help)
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "help" ]]; then
+  usage
+  exit 0
+elif [[ "${1:-}" == "--version" ]] || [[ "${1:-}" == "-v" ]]; then
+  show_version
+  exit 0
+fi
+
+cmd="${1:-}"
+
+# Handle init command specially (no config warning needed)
+if [[ "$cmd" == "init" ]]; then
+  load_config true  # Skip warning for init
+  init_config
+  exit 0
+fi
+
+# Load configuration (with warning if no config found)
+load_config
+
+# Check dependencies before processing commands
+check_dependencies
+
+case "$cmd" in
+  start)
+    shift
+    start_with_ticket "$@"
+    ;;
+  stop)
+    stop_with_summary
+    ;;
+  status|list-workspaces|list-projects|list-projects-ws|proj-id)
+    passthrough_command "$cmd" "${@:2}"
+    ;;
+  ""|help|-h|--help)
+    usage
+    ;;
+  *)
+    die "Unknown command: $cmd (try: $(basename "$0") help)"
+    ;;
+esac
+
+# Debug note (stderr), only when TASK_TRACKER_DEBUG=1
+if [[ -n "${CONFIG_LOADED_FROM:-}" && "${TASK_TRACKER_DEBUG:-}" == "1" ]]; then
+  echo "Loaded config: $CONFIG_LOADED_FROM" >&2
+fi

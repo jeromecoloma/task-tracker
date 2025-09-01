@@ -1,0 +1,46 @@
+# Task Tracker Configuration Example
+# Copy this to .tasktrackerrc, ~/.tasktrackerrc, or ~/.config/task-tracker/.tasktrackerrc
+
+# Ticket ID formatting (optional)
+# These will be used to format ticket IDs in time tracking descriptions
+# Example: ticket ID "12345" with prefix "TICKET-" becomes "[TICKET-12345]"
+
+# Prefix to add before ticket ID
+TICKET_PREFIX="#"
+
+# Suffix to add after ticket ID (usually left empty)
+TICKET_SUFFIX=""
+
+# Default subject when none provided on command line
+# Used when running: task-tracker start 12345 (without subject)
+DEFAULT_SUBJECT="Ticket Update"
+
+# Support person name (for stop command summary)
+SUPPORT_NAME="Your Name"
+
+# Zendesk base URL (for generating ticket links in stop command summary)
+# Example: https://yourcompany.zendesk.com
+ZENDESK_BASE_URL="https://yourcompany.zendesk.com"
+
+# Timezone for timestamps in stop command summary
+# Example: "Asia/Manila", "America/New_York", "Europe/London", "UTC"
+# If not set, uses system local timezone
+TIMEZONE="Asia/Manila"
+
+# Copy time entry summary to clipboard on stop (true/false)
+# Set to false to disable clipboard copying
+COPY_TO_CLIPBOARD="true"
+
+# Examples of different formatting styles:
+# For Jira-style tickets: TICKET_PREFIX="PROJ-"
+# For GitHub issues: TICKET_PREFIX="#" 
+# For plain numbers: TICKET_PREFIX="" and TICKET_SUFFIX=""
+
+# Examples of different default subjects:
+# DEFAULT_SUBJECT="Ticket Update"          -> "[#12345] Ticket Update"
+# DEFAULT_SUBJECT="Development work"       -> "[#12345] Development work"  
+# DEFAULT_SUBJECT="Task work"              -> "[#12345] Task work"
+
+# Usage examples:
+# task-tracker start 12345                        -> "[#12345] Ticket Update"
+# task-tracker start 12345 "Fix login bug"        -> "[#12345] Fix login bug"
