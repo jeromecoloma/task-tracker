@@ -4,7 +4,7 @@
 set -euo pipefail
 
 TASK_TRACKER_REPO_USER="${TASK_TRACKER_REPO_USER:-jeromecoloma}"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/bin}"
 CONFIG_DIR="${HOME}/.config/task-tracker"
 
 # Color codes
@@ -20,12 +20,11 @@ info() { printf "${BLUE}ℹ️  %s${RESET}\n" "$*" >&2; }
 success() { printf "${GREEN}✅ %s${RESET}\n" "$*" >&2; }
 warn() { printf "${YELLOW}⚠️  %s${RESET}\n" "$*" >&2; }
 
-# Check if running with sufficient privileges
-check_privileges() {
-  if [[ ! -w "$INSTALL_DIR" ]]; then
-    if [[ $EUID -ne 0 ]]; then
-      die "Installation requires write access to $INSTALL_DIR. Please run with sudo or as root."
-    fi
+# Create install directory if needed
+create_install_dir() {
+  if [[ ! -d "$INSTALL_DIR" ]]; then
+    info "Creating install directory $INSTALL_DIR..."
+    mkdir -p "$INSTALL_DIR" || die "Failed to create $INSTALL_DIR"
   fi
 }
 
@@ -64,11 +63,6 @@ install_task_tracker() {
   local target="$INSTALL_DIR/task-tracker"
   
   info "Installing task-tracker to $target..."
-  
-  # Create install directory if it doesn't exist
-  if [[ ! -d "$INSTALL_DIR" ]]; then
-    mkdir -p "$INSTALL_DIR" || die "Failed to create $INSTALL_DIR"
-  fi
   
   # Download and install
   download_file "$script_url" "$target"
@@ -134,6 +128,23 @@ verify_dependencies() {
   fi
 }
 
+# Check if ~/bin is in PATH
+check_path() {
+  info "Checking PATH configuration..."
+  
+  if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+    warn "$INSTALL_DIR is not in your PATH"
+    printf "\n${YELLOW}To fix this, add the following line to your shell config file:${RESET}\n" >&2
+    printf "  ~/.bashrc (for bash) or ~/.zshrc (for zsh):\n\n" >&2
+    printf "${GREEN}export PATH=\"\$HOME/bin:\$PATH\"${RESET}\n\n" >&2
+    printf "Then restart your shell or run: ${GREEN}source ~/.bashrc${RESET} or ${GREEN}source ~/.zshrc${RESET}\n\n" >&2
+    return 1
+  else
+    success "$INSTALL_DIR is already in your PATH"
+    return 0
+  fi
+}
+
 # Test installation
 test_installation() {
   info "Testing installation..."
@@ -142,7 +153,7 @@ test_installation() {
     task-tracker --version >&2
     success "Installation successful!"
   else
-    warn "task-tracker not found in PATH. You may need to restart your shell or add $INSTALL_DIR to your PATH."
+    warn "task-tracker not found in PATH. Please check the PATH configuration above."
   fi
 }
 
@@ -200,13 +211,12 @@ Options:
 
 Environment Variables:
   TASK_TRACKER_REPO_USER    GitHub username (default: jeromecoloma)
-  INSTALL_DIR               Installation directory (default: /usr/local/bin)
+  INSTALL_DIR               Installation directory (default: $HOME/bin)
 
 Examples:
   $0                        # Standard installation
   $0 --force               # Force reinstall
   $0 --uninstall           # Uninstall task-tracker
-  sudo $0                  # Install with elevated privileges
 HELP
         exit 0
         ;;
@@ -219,7 +229,6 @@ HELP
   printf "\n${BLUE}${BOLD}📋 Task Tracker Installation${RESET}\n\n" >&2
   
   if [[ "$uninstall" == "true" ]]; then
-    check_privileges
     uninstall_task_tracker
     return 0
   fi
@@ -232,17 +241,29 @@ HELP
   fi
   
   check_dependencies
-  check_privileges
+  create_install_dir
   verify_dependencies
   install_task_tracker
   install_config
-  test_installation
   
-  printf "\n${GREEN}${BOLD}🎉 Installation Complete!${RESET}\n\n" >&2
-  printf "${BLUE}Next steps:${RESET}\n" >&2
-  printf "1. Run: ${GREEN}task-tracker init${RESET} to set up configuration\n" >&2
-  printf "2. Make sure toggl-track and zendesk-cli are configured\n" >&2
-  printf "3. Start tracking: ${GREEN}task-tracker start \"Task description\" 12345${RESET}\n\n" >&2
+  local path_ok=0
+  check_path || path_ok=1
+  
+  if [[ $path_ok -eq 0 ]]; then
+    test_installation
+    printf "\n${GREEN}${BOLD}🎉 Installation Complete!${RESET}\n\n" >&2
+    printf "${BLUE}Next steps:${RESET}\n" >&2
+    printf "1. Run: ${GREEN}task-tracker init${RESET} to set up configuration\n" >&2
+    printf "2. Make sure toggl-track and zendesk-cli are configured\n" >&2
+    printf "3. Start tracking: ${GREEN}task-tracker start 12345 \"Task description\"${RESET}\n\n" >&2
+  else
+    printf "\n${GREEN}${BOLD}🎉 Installation Complete!${RESET}\n\n" >&2
+    printf "${YELLOW}${BOLD}Important:${RESET} Please add ~/bin to your PATH and restart your shell\n" >&2
+    printf "\n${BLUE}Then run these steps:${RESET}\n" >&2
+    printf "1. Run: ${GREEN}task-tracker init${RESET} to set up configuration\n" >&2
+    printf "2. Make sure toggl-track and zendesk-cli are configured\n" >&2
+    printf "3. Start tracking: ${GREEN}task-tracker start 12345 \"Task description\"${RESET}\n\n" >&2
+  fi
 }
 
 main "$@"

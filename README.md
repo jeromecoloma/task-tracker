@@ -24,8 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/jeromecoloma/task-tracker/main/inst
 ```bash
 git clone https://github.com/jeromecoloma/task-tracker.git
 cd task-tracker
-chmod +x task-tracker
-sudo cp task-tracker /usr/local/bin/
+chmod +x install.sh
+./install.sh
 ```
 
 ## Dependencies
